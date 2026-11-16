@@ -116,6 +116,14 @@ Use ".open FILENAME" to reopen on a persistent database."#
                 println!("Unrecognized keyword at start of '{input}'.");
                 continue;
             }
+            Err(PrepareError::StringTooLong) => {
+                println!("String is too long.");
+                continue;
+            }
+            Err(PrepareError::NegativeId) => {
+                println!("ID must be positive.");
+                continue;
+            }
         };
         match execute_statement(&statement, &mut table) {
             Ok(()) => println!("Executed."),
@@ -135,19 +143,20 @@ fn prepare_statement(input: &str) -> Result<Statement, PrepareError> {
     let mut parts = input.split_whitespace();
     match parts.next() {
         Some("insert") => {
-            let id = parts
-                .next()
-                .ok_or(PrepareError::SyntaxError)?
-                .parse::<u32>()
-                .map_err(|_| PrepareError::SyntaxError)?;
+            let token = parts.next().ok_or(PrepareError::SyntaxError)?;
+            let id: i64 = token.parse().map_err(|_| PrepareError::SyntaxError)?;
+            if id < 0 {
+                return Err(PrepareError::NegativeId);
+            }
+            let id = u32::try_from(id).map_err(|_| PrepareError::SyntaxError)?;
 
             let username = parts.next().ok_or(PrepareError::SyntaxError)?;
             if username.len() > COLUMN_USERNAME_SIZE {
-                return Err(PrepareError::SyntaxError);
+                return Err(PrepareError::StringTooLong);
             }
             let email = parts.next().ok_or(PrepareError::SyntaxError)?;
             if email.len() > COLUMN_EMAIL_SIZE {
-                return Err(PrepareError::SyntaxError);
+                return Err(PrepareError::StringTooLong);
             }
             let mut row = Row {
                 id,
@@ -188,6 +197,10 @@ fn execute_select(table: &Table) -> Result<(), ExecuteError> {
 fn text_field(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end])
+
+    // std::str::from_utf8(bytes)
+    //     .unwrap_or("")
+    //     .trim_matches('\0')
 }
 fn execute_statement(statement: &Statement, table: &mut Table) -> Result<(), ExecuteError> {
     match statement {
@@ -207,6 +220,8 @@ enum Statement {
 }
 enum PrepareError {
     SyntaxError,
+    StringTooLong,
+    NegativeId,
     UnrecognizedStatement,
 }
 
