@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+use thiserror::Error;
+
 const VERSION: &str = "0.0.1";
 const COLUMN_USERNAME_SIZE: usize = 32;
 const COLUMN_EMAIL_SIZE: usize = 255;
@@ -15,31 +17,52 @@ const TABLE_MAX_ROWS: usize = TABLE_MAX_PAGES * ROWS_PER_PAGE;
 
 struct Row {
     id: u32,
-    username: [u8; COLUMN_USERNAME_SIZE],
-    email: [u8; COLUMN_EMAIL_SIZE],
+    username: String,
+    email: String,
 }
 
 impl Row {
-    fn serialize(&self, dest: &mut [u8]) {
-        dest[ID_OFFSET..ID_OFFSET + ID_SIZE].copy_from_slice(&self.id.to_le_bytes());
-        dest[USERNAME_OFFSET..EMAIL_OFFSET].copy_from_slice(&self.username);
-        dest[EMAIL_OFFSET..ROW_SIZE].copy_from_slice(&self.email);
+    fn to_bytes(&self) -> [u8; ROW_SIZE] {
+        let mut bytes = [0u8; ROW_SIZE];
+        bytes[ID_OFFSET..ID_OFFSET + ID_SIZE].copy_from_slice(&self.id.to_le_bytes());
+        bytes[USERNAME_OFFSET..USERNAME_OFFSET + self.username.len()]
+            .copy_from_slice(self.username.as_bytes());
+        bytes[EMAIL_OFFSET..EMAIL_OFFSET + self.email.len()].copy_from_slice(self.email.as_bytes());
+        bytes
     }
-    fn deserialize(src: &[u8]) -> Row {
-        let id_bytes: [u8; ID_SIZE] = src[ID_OFFSET..ID_OFFSET + ID_SIZE]
-            .try_into()
-            .expect("id slice must be exactly ID_SIZE bytes");
-        let id = u32::from_le_bytes(id_bytes);
-        let mut username = [0u8; COLUMN_USERNAME_SIZE];
-        username.copy_from_slice(&src[USERNAME_OFFSET..EMAIL_OFFSET]);
-        let mut email = [0u8; COLUMN_EMAIL_SIZE];
-        email.copy_from_slice(&src[EMAIL_OFFSET..ROW_SIZE]);
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let id = u32::from_le_bytes(bytes[ID_OFFSET..ID_OFFSET + ID_SIZE].try_into().unwrap());
+        let username = String::from_utf8_lossy(&bytes[USERNAME_OFFSET..EMAIL_OFFSET])
+            .trim_end_matches('\0')
+            .to_string();
+        let email = String::from_utf8_lossy(&bytes[EMAIL_OFFSET..ROW_SIZE])
+            .trim_end_matches('\0')
+            .to_string();
         Row {
             id,
             username,
             email,
         }
     }
+}
+
+#[derive(Error, Debug)]
+pub enum DbError {
+    #[error("Syntax error. Could not parse statement.")]
+    SyntaxError,
+
+    #[error("String is too long.")]
+    StringTooLong,
+
+    #[error("ID must be positive.")]
+    NegativeId,
+
+    #[error("Error: Table full.")]
+    TableFull,
+
+    #[error("Unrecognized keyword at start of '{0}'.")]
+    UnrecognizedStatement(String),
 }
 
 type Page = Box<[u8; PAGE_SIZE]>;
@@ -109,26 +132,14 @@ Use ".open FILENAME" to reopen on a persistent database."#
 
         let statement = match prepare_statement(input) {
             Ok(state) => state,
-            Err(PrepareError::SyntaxError) => {
-                println!("Syntax error. Could not parse statement.");
-                continue;
-            }
-            Err(PrepareError::UnrecognizedStatement) => {
-                println!("Unrecognized keyword at start of '{input}'.");
-                continue;
-            }
-            Err(PrepareError::StringTooLong) => {
-                println!("String is too long.");
-                continue;
-            }
-            Err(PrepareError::NegativeId) => {
-                println!("ID must be positive.");
+            Err(e) => {
+                println!("Error: {}", e);
                 continue;
             }
         };
         match execute_statement(&statement, &mut table) {
             Ok(()) => println!("Executed."),
-            Err(ExecuteError::TableFull) => println!("Error: Table full."),
+            Err(e) => println!("Error: {}", e),
         }
     }
 }
@@ -140,70 +151,57 @@ fn do_meta_command(input_buffer: &str) -> MetaCommandResult {
     }
 }
 
-fn prepare_statement(input: &str) -> Result<Statement, PrepareError> {
+fn prepare_statement(input: &str) -> Result<Statement, DbError> {
     let mut parts = input.split_whitespace();
     match parts.next() {
         Some("insert") => {
-            let token = parts.next().ok_or(PrepareError::SyntaxError)?;
-            let id: i64 = token.parse().map_err(|_| PrepareError::SyntaxError)?;
+            let token = parts.next().ok_or(DbError::SyntaxError)?;
+            let id: i64 = token.parse().map_err(|_| DbError::SyntaxError)?;
             if id < 0 {
-                return Err(PrepareError::NegativeId);
+                return Err(DbError::NegativeId);
             }
-            let id = u32::try_from(id).map_err(|_| PrepareError::SyntaxError)?;
+            let id = u32::try_from(id).map_err(|_| DbError::SyntaxError)?;
 
-            let username = parts.next().ok_or(PrepareError::SyntaxError)?;
+            let username = parts.next().ok_or(DbError::SyntaxError)?.to_string();
             if username.len() > COLUMN_USERNAME_SIZE {
-                return Err(PrepareError::StringTooLong);
+                return Err(DbError::StringTooLong);
             }
-            let email = parts.next().ok_or(PrepareError::SyntaxError)?;
+            let email = parts.next().ok_or(DbError::SyntaxError)?.to_string();
             if email.len() > COLUMN_EMAIL_SIZE {
-                return Err(PrepareError::StringTooLong);
+                return Err(DbError::StringTooLong);
             }
-            let mut row = Row {
+
+            Ok(Statement::Insert(Row {
                 id,
-                username: [0; COLUMN_USERNAME_SIZE],
-                email: [0; COLUMN_EMAIL_SIZE],
-            };
-            row.username[..username.len()].copy_from_slice(username.as_bytes());
-            row.email[..email.len()].copy_from_slice(email.as_bytes());
-            Ok(Statement::Insert(row))
+                username,
+                email,
+            }))
         }
         Some("select") => Ok(Statement::Select),
-        _ => Err(PrepareError::UnrecognizedStatement),
+        _ => Err(DbError::UnrecognizedStatement(input.to_string())),
     }
 }
 
-fn execute_insert(row: &Row, table: &mut Table) -> Result<(), ExecuteError> {
+fn execute_insert(row: &Row, table: &mut Table) -> Result<(), DbError> {
     if table.num_rows >= TABLE_MAX_ROWS {
-        return Err(ExecuteError::TableFull);
+        return Err(DbError::TableFull);
     }
-    row.serialize(table.row_slot_mut(table.num_rows));
+    let bytes = row.to_bytes();
+    table.row_slot_mut(table.num_rows).copy_from_slice(&bytes);
+
     table.num_rows += 1;
     Ok(())
 }
 
-fn execute_select(table: &Table) -> Result<(), ExecuteError> {
+fn execute_select(table: &Table) -> Result<(), DbError> {
     for i in 0..table.num_rows {
-        let row = Row::deserialize(table.row_slot(i));
-        println!(
-            "({}, {}, {})",
-            row.id,
-            text_field(&row.username),
-            text_field(&row.email)
-        )
+        let row = Row::from_bytes(table.row_slot(i));
+        println!("({}, {}, {})", row.id, row.username, row.email)
     }
     Ok(())
 }
 
-fn text_field(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end])
-
-    // std::str::from_utf8(bytes)
-    //     .unwrap_or("")
-    //     .trim_matches('\0')
-}
-fn execute_statement(statement: &Statement, table: &mut Table) -> Result<(), ExecuteError> {
+fn execute_statement(statement: &Statement, table: &mut Table) -> Result<(), DbError> {
     match statement {
         Statement::Insert(row) => execute_insert(row, table),
         Statement::Select => execute_select(table),
@@ -220,19 +218,6 @@ enum Statement {
     Select,
 }
 
-#[derive(Debug)]
-enum PrepareError {
-    SyntaxError,
-    StringTooLong,
-    NegativeId,
-    UnrecognizedStatement,
-}
-
-#[derive(Debug)]
-enum ExecuteError {
-    TableFull,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,10 +229,10 @@ mod tests {
         execute_statement(&statement, &mut table).unwrap();
 
         assert_eq!(table.num_rows, 1);
-        let row = Row::deserialize(table.row_slot(0));
+        let row = Row::from_bytes(table.row_slot(0));
         assert_eq!(row.id, 1);
-        assert_eq!(text_field(&row.username), "user1");
-        assert_eq!(text_field(&row.email), "person1@example.com");
+        assert_eq!(&row.username, "user1");
+        assert_eq!(&row.email, "person1@example.com");
     }
 
     #[test]
@@ -256,18 +241,18 @@ mod tests {
         for i in 0..TABLE_MAX_ROWS {
             let stmt = Statement::Insert(Row {
                 id: i as u32,
-                username: [0; COLUMN_USERNAME_SIZE],
-                email: [0; COLUMN_EMAIL_SIZE],
+                username: "tester".to_string(),
+                email: "tester@example.com".to_string(),
             });
             assert!(execute_statement(&stmt, &mut table).is_ok());
         }
         let stmt = Statement::Insert(Row {
             id: 9999,
-            username: [0; COLUMN_USERNAME_SIZE],
-            email: [0; COLUMN_EMAIL_SIZE],
+            username: "tester".to_string(),
+            email: "tester@example.com".to_string(),
         });
         let result = execute_statement(&stmt, &mut table);
-        assert!(matches!(result, Err(ExecuteError::TableFull)));
+        assert!(matches!(result, Err(DbError::TableFull)));
     }
 
     #[test]
@@ -275,12 +260,12 @@ mod tests {
         let long_username = "a".repeat(COLUMN_USERNAME_SIZE + 1);
         let input = format!("insert 1 {} email@example.com", long_username);
         let result = prepare_statement(&input);
-        assert!(matches!(result, Err(PrepareError::StringTooLong)));
+        assert!(matches!(result, Err(DbError::StringTooLong)));
     }
 
     #[test]
     fn test_negative_id() {
         let result = prepare_statement("insert -1 user email");
-        assert!(matches!(result, Err(PrepareError::NegativeId)));
+        assert!(matches!(result, Err(DbError::NegativeId)));
     }
 }
