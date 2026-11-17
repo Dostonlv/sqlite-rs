@@ -12,6 +12,7 @@ const PAGE_SIZE: usize = 4096;
 const TABLE_MAX_PAGES: usize = 100;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
 const TABLE_MAX_ROWS: usize = TABLE_MAX_PAGES * ROWS_PER_PAGE;
+
 struct Row {
     id: u32,
     username: [u8; COLUMN_USERNAME_SIZE],
@@ -218,6 +219,8 @@ enum Statement {
     Insert(Row),
     Select,
 }
+
+#[derive(Debug)]
 enum PrepareError {
     SyntaxError,
     StringTooLong,
@@ -225,6 +228,59 @@ enum PrepareError {
     UnrecognizedStatement,
 }
 
+#[derive(Debug)]
 enum ExecuteError {
     TableFull,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_insert_and_retrieve() {
+        let mut table = Table::new();
+        let statement = prepare_statement("insert 1 user1 person1@example.com").unwrap();
+        execute_statement(&statement, &mut table).unwrap();
+
+        assert_eq!(table.num_rows, 1);
+        let row = Row::deserialize(table.row_slot(0));
+        assert_eq!(row.id, 1);
+        assert_eq!(text_field(&row.username), "user1");
+        assert_eq!(text_field(&row.email), "person1@example.com");
+    }
+
+    #[test]
+    fn test_table_full() {
+        let mut table = Table::new();
+        for i in 0..TABLE_MAX_ROWS {
+            let stmt = Statement::Insert(Row {
+                id: i as u32,
+                username: [0; COLUMN_USERNAME_SIZE],
+                email: [0; COLUMN_EMAIL_SIZE],
+            });
+            assert!(execute_statement(&stmt, &mut table).is_ok());
+        }
+        let stmt = Statement::Insert(Row {
+            id: 9999,
+            username: [0; COLUMN_USERNAME_SIZE],
+            email: [0; COLUMN_EMAIL_SIZE],
+        });
+        let result = execute_statement(&stmt, &mut table);
+        assert!(matches!(result, Err(ExecuteError::TableFull)));
+    }
+
+    #[test]
+    fn test_string_too_long() {
+        let long_username = "a".repeat(COLUMN_USERNAME_SIZE + 1);
+        let input = format!("insert 1 {} email@example.com", long_username);
+        let result = prepare_statement(&input);
+        assert!(matches!(result, Err(PrepareError::StringTooLong)));
+    }
+
+    #[test]
+    fn test_negative_id() {
+        let result = prepare_statement("insert -1 user email");
+        assert!(matches!(result, Err(PrepareError::NegativeId)));
+    }
 }
