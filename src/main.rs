@@ -1,4 +1,8 @@
-use std::io::{self, Write};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 use thiserror::Error;
 
@@ -15,6 +19,7 @@ const TABLE_MAX_PAGES: usize = 100;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
 const TABLE_MAX_ROWS: usize = TABLE_MAX_PAGES * ROWS_PER_PAGE;
 
+#[derive(Debug, PartialEq)]
 struct Row {
     id: u32,
     username: String,
@@ -63,52 +68,125 @@ pub enum DbError {
 
     #[error("Unrecognized keyword at start of '{0}'.")]
     UnrecognizedStatement(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Tried to fetch page number out of bounds: {0}")]
+    PageOutOfBounds(usize),
 }
 
 type Page = Box<[u8; PAGE_SIZE]>;
 
-struct Table {
-    num_rows: usize,
+struct Pager {
+    file: File,
+    file_length: u64,
     pages: Vec<Option<Page>>,
 }
 
-impl Table {
-    fn new() -> Self {
-        Table {
-            num_rows: 0,
+impl Pager {
+    fn open(path: impl AsRef<Path>) -> Result<Pager, DbError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let file_length = file.metadata()?.len();
+        Ok(Pager {
+            file,
+            file_length,
             pages: vec![None; TABLE_MAX_PAGES],
+        })
+    }
+
+    fn get_page(&mut self, page_num: usize) -> Result<&mut Page, DbError> {
+        if page_num >= TABLE_MAX_PAGES {
+            return Err(DbError::PageOutOfBounds(page_num));
         }
+
+        let slot = &mut self.pages[page_num];
+        match slot {
+            Some(page) => Ok(page),
+            None => {
+                let mut page: Page = Box::new([0u8; PAGE_SIZE]);
+                let offset = (page_num * PAGE_SIZE) as u64;
+                if offset < self.file_length {
+                    let n = (self.file_length - offset).min(PAGE_SIZE as u64) as usize;
+                    self.file.seek(SeekFrom::Start(offset))?;
+                    self.file.read_exact(&mut page[..n])?;
+                }
+                Ok(slot.insert(page))
+            }
+        }
+    }
+
+    fn flush(&mut self, page_num: usize, size: usize) -> Result<(), DbError> {
+        let Some(page) = &self.pages[page_num] else {
+            return Ok(());
+        };
+        self.file
+            .seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64))?;
+        self.file.write_all(&page[..size])?;
+        Ok(())
+    }
+}
+
+struct Table {
+    num_rows: usize,
+    pager: Pager,
+}
+
+impl Table {
+    fn open(path: impl AsRef<Path>) -> Result<Table, DbError> {
+        let pager = Pager::open(path)?;
+        let len = pager.file_length as usize;
+        let num_rows = (len / PAGE_SIZE) * ROWS_PER_PAGE + (len % PAGE_SIZE) / ROW_SIZE;
+        Ok(Table { num_rows, pager })
     }
     fn locate(row_num: usize) -> (usize, usize) {
         let page_num = row_num / ROWS_PER_PAGE;
         let byte_offset = (row_num % ROWS_PER_PAGE) * ROW_SIZE;
         (page_num, byte_offset)
     }
-    fn row_slot_mut(&mut self, row_num: usize) -> &mut [u8] {
+
+    fn row_slot(&mut self, row_num: usize) -> Result<&mut [u8], DbError> {
         let (page_num, byte_offset) = Table::locate(row_num);
-        // &mut self.pages[page_num].as_mut().unwrap()[byte_offset..byte_offset + ROW_SIZE]
-        let page = self.pages[page_num].get_or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
-        &mut page[byte_offset..byte_offset + ROW_SIZE]
+        let page = self.pager.get_page(page_num)?;
+        Ok(&mut page[byte_offset..byte_offset + ROW_SIZE])
     }
 
-    fn row_slot(&self, row_num: usize) -> &[u8] {
-        let (page_num, byte_offset) = Table::locate(row_num);
-        let page = self.pages[page_num]
-            .as_ref()
-            .expect("page must exist for a stored row");
-        &page[byte_offset..byte_offset + ROW_SIZE]
+    fn close(mut self) -> Result<(), DbError> {
+        let full_pages = self.num_rows / ROWS_PER_PAGE;
+        for i in 0..full_pages {
+            self.pager.flush(i, PAGE_SIZE)?;
+        }
+        let rem = self.num_rows % ROWS_PER_PAGE;
+        if rem > 0 {
+            self.pager.flush(full_pages, rem * ROW_SIZE)?;
+        }
+        self.pager.file.sync_all()?;
+        Ok(())
+    }
+    fn get_row(&mut self, row_num: usize) -> Result<Row, DbError> {
+        Ok(Row::from_bytes(self.row_slot(row_num)?))
     }
 }
-fn main() -> io::Result<()> {
+fn main() -> Result<(), DbError> {
     println!(
         r#"SQLite version {VERSION}
 Enter ".help" for usage hints.
 Connected to a transient in-memory database.
 Use ".open FILENAME" to reopen on a persistent database."#
     );
+
     let stdin = io::stdin();
     let mut buffer = String::new();
-    let mut table = Table::new();
+    let Some(path) = std::env::args().nth(1) else {
+        eprintln!("Must supply a database filename.");
+        std::process::exit(1);
+    };
+    let mut table = Table::open(path)?;
 
     loop {
         print!("sqlite> ");
@@ -116,7 +194,7 @@ Use ".open FILENAME" to reopen on a persistent database."#
         buffer.clear();
 
         if stdin.read_line(&mut buffer)? == 0 {
-            break Ok(());
+            break;
         }
         let input = buffer.trim();
 
@@ -126,22 +204,23 @@ Use ".open FILENAME" to reopen on a persistent database."#
                     println!("Unrecognized command {}", input);
                     continue;
                 }
-                MetaCommandResult::Exit => break Ok(()),
+                MetaCommandResult::Exit => break,
             }
         }
 
         let statement = match prepare_statement(input) {
             Ok(state) => state,
             Err(e) => {
-                println!("Error: {}", e);
+                println!("{}", e);
                 continue;
             }
         };
         match execute_statement(&statement, &mut table) {
             Ok(()) => println!("Executed."),
-            Err(e) => println!("Error: {}", e),
+            Err(e) => println!("{}", e),
         }
     }
+    table.close()
 }
 
 fn do_meta_command(input_buffer: &str) -> MetaCommandResult {
@@ -187,15 +266,15 @@ fn execute_insert(row: &Row, table: &mut Table) -> Result<(), DbError> {
         return Err(DbError::TableFull);
     }
     let bytes = row.to_bytes();
-    table.row_slot_mut(table.num_rows).copy_from_slice(&bytes);
+    table.row_slot(table.num_rows)?.copy_from_slice(&bytes);
 
     table.num_rows += 1;
     Ok(())
 }
 
-fn execute_select(table: &Table) -> Result<(), DbError> {
+fn execute_select(table: &mut Table) -> Result<(), DbError> {
     for i in 0..table.num_rows {
-        let row = Row::from_bytes(table.row_slot(i));
+        let row = table.get_row(i).unwrap();
         println!("({}, {}, {})", row.id, row.username, row.email)
     }
     Ok(())
@@ -223,21 +302,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_insert_and_retrieve() {
-        let mut table = Table::new();
-        let statement = prepare_statement("insert 1 user1 person1@example.com").unwrap();
-        execute_statement(&statement, &mut table).unwrap();
-
+    fn test_insert_and_retrieve() -> Result<(), DbError> {
+        let (_dir, mut table) = test_table();
+        execute_statement(
+            &prepare_statement("insert 1 user1 person1@example.com")?,
+            &mut table,
+        )?;
         assert_eq!(table.num_rows, 1);
-        let row = Row::from_bytes(table.row_slot(0));
-        assert_eq!(row.id, 1);
-        assert_eq!(&row.username, "user1");
-        assert_eq!(&row.email, "person1@example.com");
+        assert_eq!(
+            table.get_row(0)?,
+            Row {
+                id: 1,
+                username: "user1".into(),
+                email: "person1@example.com".into()
+            }
+        );
+        Ok(())
     }
 
     #[test]
     fn test_table_full() {
-        let mut table = Table::new();
+        let (_dir, mut table) = test_table();
         for i in 0..TABLE_MAX_ROWS {
             let stmt = Statement::Insert(Row {
                 id: i as u32,
@@ -267,5 +352,49 @@ mod tests {
     fn test_negative_id() {
         let result = prepare_statement("insert -1 user email");
         assert!(matches!(result, Err(DbError::NegativeId)));
+    }
+
+    fn test_table() -> (tempfile::TempDir, Table) {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::open(dir.path().join("test.db")).unwrap();
+        (dir, table)
+    }
+
+    #[test]
+    fn keeps_data_after_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut t = Table::open(&path).unwrap();
+        let stmt = prepare_statement("insert 1 user1 person1@example.com").unwrap();
+        execute_statement(&stmt, &mut t).unwrap();
+        t.close().unwrap();
+
+        let mut t = Table::open(&path).unwrap();
+        assert_eq!(t.num_rows, 1);
+        let row = t.get_row(0).unwrap();
+        assert_eq!(row.username, "user1");
+    }
+
+    #[test]
+    fn row_count_survives_many_pages() -> Result<(), DbError> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test.db");
+        let n = ROWS_PER_PAGE * 15 + 3;
+
+        let mut t = Table::open(&path)?;
+        for i in 0..n {
+            let stmt = Statement::Insert(Row {
+                id: i as u32,
+                username: "u".into(),
+                email: "e".into(),
+            });
+            execute_statement(&stmt, &mut t)?;
+        }
+        t.close()?;
+
+        let t = Table::open(&path)?;
+        assert_eq!(t.num_rows, n);
+        Ok(())
     }
 }
